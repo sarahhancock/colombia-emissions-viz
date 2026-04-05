@@ -484,6 +484,11 @@ function getProvinceName(feature) {
   return null;
 }
 
+function getDefaultProvinceSelection() {
+  const firstProvince = state.provinceNames[0] ?? null;
+  return firstProvince ? (resolveProvinceKey(firstProvince) ?? firstProvince) : null;
+}
+
 function syncSelectedLabel() {
   if (state.el.selectedRegion) {
     state.el.selectedRegion.textContent = getCurrentPlaceLabel();
@@ -1262,6 +1267,8 @@ function initSelects() {
 async function handleViewModeChange() {
   if (getViewMode() === "colombia") {
     state.selectedProvince = null;
+  } else if (!resolveProvinceKey(state.selectedProvince)) {
+    state.selectedProvince = getDefaultProvinceSelection();
   }
   syncSelectedLabel();
   if (state.provinceLayer) state.provinceLayer.setStyle(f => provinceFeatureStyle(f));
