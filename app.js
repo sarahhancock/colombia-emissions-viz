@@ -2,128 +2,79 @@
    app.js
 
    Responsibilities:
-   - Load state + national CSV data
-   - Initialize Leaflet map + state outlines
-   - Optional gridded GeoTIFF overlay with slider + legend
-   - Charts (bar + timeseries) with uncertainty
-   - Export currently displayed chart data as CSV
+   - Load all visualization data from data/chart/chart_data.json
+   - Initialize Leaflet map for Colombia
+   - Rebuild grid-cell polygons from embedded lat/lon arrays
+   - Support Department / Colombia chart views
+   - Draw bar + annual trend charts with uncertainty
+   - Export chart data as CSV and the grid overlay as NetCDF
    ========================================================= */
 
-/* ===================== CONFIG ===================== */
+const CHART_DATA_PATH = "data/chart/chart_data.json";
+const DEFAULT_SECTOR = "TotalAnth";
+const DISPLAY_SECTORS = ["Coal", "Waste", "OilGas", "Livestock", "Reservoirs", "Rice", "Other", "TotalAnth"];
+const BAR_DISPLAY_SECTORS = ["Coal", "Waste", "OilGas", "Livestock", "Reservoirs", "Rice", "Other"];
 
-// Years + paths
-const YEARS = [2019, 2020, 2021, 2022, 2023, 2024];
-const PRIOR_YEARS = [2019, 2020];
-
-const CSV_PATH = (year) => `data/csv/estrada_states_${year}.csv`;
-const NATIONAL_CSV_PATH = "data/csv/national_emissions.csv";
-const NATIONAL_CSV_PATH_PRIOR = "data/csv/national_prior_emissions_2017_2020.csv";
-const NETCDF_PATH = (year, emisSource) =>
-  (emisSource === "ghgi")
-    ? `data/nc/prior_${year}.nc`
-    : `data/nc/posterior_ens_mean_${year}.nc`;
-
-
-// GeoJSON
-const STATES_GEOJSON_PATH = "data/ne/us_states_simplified.geojson";
-
-// State outline styling
-const STATES_FILL_OPACITY = 0.0;
-const STATES_LINE_COLOR = "#666";
-const STATES_LINE_WEIGHT = 0.8;
-
-// Scenario naming in state CSV
-const SCENARIO_SUFFIX = "_posterior";
-
-// Sector inclusion/exclusion + labels
-const DEFAULT_SECTOR = "Total_ExclSoilAbs";
-const EXCLUDED_SECTORS = [
-  "Total",
-  "OtherAnth",
-  "Gas",
-  "Oil",
-  "Lakes",
-  "Seeps",
-  "Termites",
-  "SoilAbsorb",
-];
+const DISPLAY_SECTOR_MAP = {
+  Coal: ["Coal"],
+  Waste: ["Landfills", "Wastewater"],
+  OilGas: ["OilGas"],
+  Livestock: ["Livestock"],
+  Reservoirs: ["Reservoirs"],
+  Rice: ["Rice"],
+  Other: ["OtherAnth"],
+  TotalAnth: ["TotalAnth"],
+};
 
 const SECTOR_LABELS = {
-  ONG: "Oil/Gas",
+  Coal: "Coal",
+  Waste: "Waste",
+  OilGas: "Oil/Gas",
   Livestock: "Livestock",
-  Total_ExclSoilAbs: "Total",
+  Reservoirs: "Reservoirs",
+  Rice: "Rice",
+  Other: "Other",
+  TotalAnth: "Total anthropogenic",
 };
 
-// Grid overlay
-const GRID_MANIFEST_PATH = "data/manifest.json";
-const GRID_VAR_BY_SECTOR = {
-  Total_ExclSoilAbs: "EmisCH4_Total",
-  Landfills: "EmisCH4_Landfills",
-  Wastewater: "EmisCH4_Wastewater",
-  Livestock: "EmisCH4_Livestock",
-  Coal: "EmisCH4_Coal",
-  ONG: "EmisCH4_ONG",
-  Rice: "EmisCH4_Rice",
-  BiomassBurning: "EmisCH4_BiomassBurning",
-  Wetlands: "EmisCH4_Wetlands",
-  Reservoirs: "EmisCH4_Reservoirs",
-};
-
-const GRID_UNITS_HTML = "kg km<sup>-2</sup> h<sup>-1</sup>";
+const GRID_OPACITY = 0.65;
 const GRID_COLORMAP = "ylorrd";
-const GRID_OPACITY = 0.40;
-const GRID_RESOLUTION = 256;
-
-/* ===================== APP STATE ===================== */
+const GRID_DEFAULT_SLIDER_FRACTION = 0.6;
+const GRID_MIN_VALUE = 0.001;
+const PROVINCE_NAME_KEYS = ["PROVINCE", "province", "NAME_1", "name", "NAME"];
+const GRID_UNITS_HTML = "kg km<sup>-2</sup> h<sup>-1</sup>";
 
 const state = {
-  // data
-  dataByYear: {},              // [year][stateName] -> row
-  nationalPosteriorByYear: {}, // GHGI+TROPOMI
-  nationalPriorByYear: {},     // GHGI
-  sectorKeys: [],              // derived from state CSV columns
-  selectedState: null,         // string | null
-  emisSource: "ghgi_tropomi",  // "ghgi" | "ghgi_tropomi"
+  chartData: null,
+  sectors: [],
+  provinceNames: [],
+  gridMeta: null,
 
-  // units (charts)
+  map: null,
+  provinceLayer: null,
+  gridLayer: null,
+  gridLegendControl: null,
+
+  selectedProvince: null,
+  currentGridCells: null,
+
+  gridOpacity: GRID_OPACITY,
+  gridDisplayMax: null,
+  gridMinValue: GRID_MIN_VALUE,
+  gridMaxValueRaw: null,
+
   unit: "Tg",
   unitFactor: 1,
-  unitLabel: "Tg/yr",
+  unitLabel: "",
 
-  // map
-  map: null,
-  statesLayer: null,
-
-  // grid overlay
-  colorbarRefEntry: null,
-  gridManifest: null,
-  gridLayer: null,
-  gridVarDomainCache: {}, // gridVar -> { min, max }
-  gridOpacity: GRID_OPACITY,
-  currentGridEntry: null,
-  currentGridVar: null,
-  gridLegendControl: null,
-  gridDisplayMax: null, // real-value max used for color scaling (null => use manifest max)
-  gridMaxT: 1.0,        // normalized slider value [0..1]
-  gridGeoraster: null,
-
-  // charts
   barChart: null,
   lineChart: null,
 
-  // cached DOM
   el: {},
 };
 
-/* ===================== UTILITIES ===================== */
-
 function $(id) {
   return document.getElementById(id);
-}
-
-function parseNumber(x) {
-  const v = Number(x);
-  return Number.isFinite(v) ? v : null;
 }
 
 function fmt(v) {
@@ -136,409 +87,630 @@ function fmt(v) {
   return Math.round(v).toString();
 }
 
-function setUnits(newUnit) {
-  state.unit = newUnit;
-  state.unitFactor = (newUnit === "Gg") ? 1000 : 1;
-  state.unitLabel = (newUnit === "Gg") ? "Gg/yr" : "Tg/yr";
-}
-
-function scaleVal(v) {
-  return (v == null || !Number.isFinite(v)) ? null : v * state.unitFactor;
-}
-
-function getNiceLimits(minVal, maxVal) {
-  if (!Number.isFinite(minVal) || !Number.isFinite(maxVal)) return { min: undefined, max: undefined };
-  if (minVal === maxVal) return { min: 0, max: maxVal * 1.1 + 1e-9 };
-
-  const pad = 0.06 * (maxVal - minVal);
-  return { min: Math.max(0, minVal - pad), max: maxVal + pad };
-}
-
 function labelSector(sectorKey) {
   return SECTOR_LABELS[sectorKey] ?? sectorKey;
 }
 
-function emisSourceLabel(emisSource) {
-  return (emisSource === "ghgi") ? "GHGI" : "GHGI+TROPOMI";
+function wrapSectorLabel(sectorKey) {
+  const label = labelSector(sectorKey);
+  if (label === "Oil/Gas") return ["Oil/Gas"];
+  if (label === "Total anthropogenic") return ["Total", "anthropogenic"];
+  return label.split(" ");
 }
 
-/* ===================== MODE + COLUMN HELPERS ===================== */
-
-function activeYears(emisSource) {
-  return (emisSource === "ghgi") ? PRIOR_YEARS : YEARS;
+function formatUnitPeriod(period) {
+  if (!period) return "";
+  return String(period).replace("-1", "⁻¹");
 }
 
-function getChartMode() {
-  const el = document.querySelector('input[name="chartMode"]:checked');
-  return el ? el.value : "state";
+function formatUnitLabel(mass, period) {
+  return period ? `${mass} ${formatUnitPeriod(period)}` : mass;
 }
 
-function getEmisSource() {
-  const el = state.el?.dataSourceSelect;
-  return el ? el.value : (state.emisSource ?? "ghgi_tropomi");
+function parseChartUnitSpec(spec) {
+  if (!spec) return { mass: "Tg", period: "a-1", label: formatUnitLabel("Tg", "a-1") };
+  const parts = String(spec).split(/\s+/);
+  const mass = parts[0] ?? "";
+  const period = parts[1] ?? "";
+  return {
+    mass,
+    period,
+    label: mass && period ? formatUnitLabel(mass, period) : String(spec),
+  };
 }
 
-function mapValueCol(emisSource) {
-  return (emisSource === "ghgi") ? "Total_prior" : "Total_posterior";
+function getStoredUnitSpec() {
+  return parseChartUnitSpec(state.chartData?.chart_units?.[getTimeMode()]);
 }
 
-function currentPlaceLabel(mode) {
-  return (mode === "national") ? "National" : (state.selectedState ?? "(none)");
+function updateUnitSelectLabels() {
+  const spec = getStoredUnitSpec();
+  const tgOpt = state.el.unitSelect?.querySelector('option[value="Tg"]');
+  const ggOpt = state.el.unitSelect?.querySelector('option[value="Gg"]');
+  if (tgOpt) tgOpt.textContent = formatUnitLabel("Tg", spec.period);
+  if (ggOpt) ggOpt.textContent = formatUnitLabel("Gg", spec.period);
 }
 
-function stateCentralCol(sectorKey, emisSource) {
-  return (emisSource === "ghgi") ? `${sectorKey}_prior` : `${sectorKey}_posterior`;
+function setUnits(newUnit) {
+  const spec = getStoredUnitSpec();
+  state.unit = newUnit;
+
+  if (newUnit === spec.mass) {
+    state.unitFactor = 1;
+    state.unitLabel = formatUnitLabel(newUnit, spec.period);
+  } else if (spec.mass === "Gg" && newUnit === "Tg") {
+    state.unitFactor = 0.001;
+    state.unitLabel = formatUnitLabel("Tg", spec.period);
+  } else if (spec.mass === "Tg" && newUnit === "Gg") {
+    state.unitFactor = 1000;
+    state.unitLabel = formatUnitLabel("Gg", spec.period);
+  } else {
+    state.unitFactor = 1;
+    state.unit = spec.mass;
+    state.unitLabel = spec.label;
+  }
 }
 
-// National columns are base sectorKey without suffix
-function centralCol(sectorKey, mode, emisSource) {
-  return (mode === "national") ? sectorKey : stateCentralCol(sectorKey, emisSource);
+function scaleVal(v) {
+  return v == null || !Number.isFinite(v) ? null : v * state.unitFactor;
 }
 
-function minCol(sectorKey) {
-  return `${sectorKey}_min`;
+function getNiceLimits(minVal, maxVal) {
+  if (!Number.isFinite(minVal) || !Number.isFinite(maxVal)) {
+    return { min: undefined, max: undefined };
+  }
+  if (minVal === maxVal) {
+    return { min: 0, max: maxVal * 1.1 + 1e-9 };
+  }
+  const pad = 0.06 * (maxVal - minVal);
+  return { min: Math.max(0, minVal - pad), max: maxVal + pad };
 }
-function maxCol(sectorKey) {
-  return `${sectorKey}_max`;
-}
-
-/* ===================== CSV EXPORT ===================== */
 
 function csvEscape(v) {
   if (v == null) return "";
   const s = String(v);
-  return (/[",\n]/.test(s)) ? `"${s.replace(/"/g, '""')}"` : s;
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
 function toCSV(rows) {
-  return rows.map(r => r.map(csvEscape).join(",")).join("\n") + "\n";
-}
-
-function downloadUrl(filename, url) {
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
+  return rows.map(row => row.map(csvEscape).join(",")).join("\n") + "\n";
 }
 
 function downloadText(filename, text, mime = "text/csv;charset=utf-8") {
   const blob = new Blob([text], { type: mime });
   const url = URL.createObjectURL(blob);
-
   const a = document.createElement("a");
   a.href = url;
   a.download = filename;
   document.body.appendChild(a);
   a.click();
   a.remove();
-
   URL.revokeObjectURL(url);
 }
 
-function makeBarCsvRows(mode, year) {
-  const place = currentPlaceLabel(mode);
-  const emisSource = getEmisSource();
-  const bar = buildBarData(year, mode, emisSource);
-
-  const rows = [
-    ["type", "bar"],
-    ["mode", mode],
-    ["place", place],
-    ["year", year],
-    ["units", state.unitLabel],
-    ["data_source", emisSourceLabel(emisSource)],
-    [],
-    ["sector", "value", "min", "max"],
-  ];
-
-  for (let i = 0; i < bar.labels.length; i++) {
-    const key = bar.labels[i];
-    rows.push([labelSector(key), bar.values[i], bar.mins[i], bar.maxs[i]]);
-  }
-  return rows;
+function pad4(n) {
+  return (4 - (n % 4)) % 4;
 }
 
-function makeLineCsvRows(mode, sectorKey) {
-  const place = currentPlaceLabel(mode);
-  const emisSource = getEmisSource();
-  const line = buildLineData(mode, sectorKey, emisSource);
-
-  const rows = [
-    ["type", "timeseries"],
-    ["mode", mode],
-    ["place", place],
-    ["sector", labelSector(sectorKey)],
-    ["units", state.unitLabel],
-    ["data_source", emisSourceLabel(emisSource)],
-    [],
-    ["year", "value", "min", "max"],
-  ];
-
-  for (let i = 0; i < line.labels.length; i++) {
-    rows.push([line.labels[i], line.values[i], line.mins[i], line.maxs[i]]);
-  }
-  return rows;
+function stringFieldSize(str) {
+  return 4 + str.length + pad4(str.length);
 }
 
-/* ===================== DATA LOADING ===================== */
+function charAttrSize(name, value) {
+  const text = String(value);
+  return stringFieldSize(name) + 4 + 4 + text.length + pad4(text.length);
+}
 
-async function fetchCSV(url) {
-  return new Promise((resolve, reject) => {
-    Papa.parse(url, {
-      download: true,
-      header: true,
-      dynamicTyping: false,
-      skipEmptyLines: true,
-      complete: (results) => resolve(results.data),
-      error: reject,
+function varSectionSize(name, dimIds, attrs) {
+  let size = stringFieldSize(name);
+  size += 4 + (dimIds.length * 4);
+  size += 4 + 4;
+  for (const attr of attrs) {
+    size += charAttrSize(attr.name, attr.value);
+  }
+  size += 4 + 4 + 4;
+  return size;
+}
+
+function writeString(view, offset, str) {
+  view.setInt32(offset, str.length, false);
+  offset += 4;
+  for (let i = 0; i < str.length; i++) {
+    view.setUint8(offset + i, str.charCodeAt(i));
+  }
+  offset += str.length;
+  offset += pad4(str.length);
+  return offset;
+}
+
+function writeCharAttr(view, offset, name, value) {
+  const text = String(value);
+  offset = writeString(view, offset, name);
+  view.setInt32(offset, 2, false);
+  offset += 4;
+  view.setInt32(offset, text.length, false);
+  offset += 4;
+  for (let i = 0; i < text.length; i++) {
+    view.setUint8(offset + i, text.charCodeAt(i));
+  }
+  offset += text.length;
+  offset += pad4(text.length);
+  return offset;
+}
+
+function downloadBlob(filename, blob) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function buildGridNetcdfBlob() {
+  const grid = state.gridMeta;
+  const timeKey = getSelectedTimeKey();
+  const sectorKey = state.el.sectorSelect.value;
+  const gridStore = getGridStoreForTime(timeKey);
+  const values = aggregateMapValues(gridStore, sectorKey);
+
+  if (!grid?.lats?.length || !grid?.lons?.length || !values?.length) {
+    throw new Error("Grid data are not available for NetCDF export.");
+  }
+
+  const lats = grid.lats.map(Number);
+  const lons = grid.lons.map(Number);
+  const nlat = lats.length;
+  const nlon = lons.length;
+  const field = values.map(v => (Number.isFinite(v) ? Number(v) : Number.NaN));
+
+  const dimSectionSize =
+    4 + 4 +
+    stringFieldSize("lat") + 4 +
+    stringFieldSize("lon") + 4;
+  const globalAttrSectionSize = 4 + 4;
+
+  const vars = [
+    {
+      name: "lat",
+      dimIds: [0],
+      type: 6,
+      dataBytes: nlat * 8,
+      attrs: [
+        { name: "long_name", value: "latitude" },
+        { name: "units", value: "degrees_north" },
+      ],
+    },
+    {
+      name: "lon",
+      dimIds: [1],
+      type: 6,
+      dataBytes: nlon * 8,
+      attrs: [
+        { name: "long_name", value: "longitude" },
+        { name: "units", value: "degrees_east" },
+      ],
+    },
+    {
+      name: "emissions",
+      dimIds: [0, 1],
+      type: 5,
+      dataBytes: nlat * nlon * 4,
+      attrs: [
+        { name: "long_name", value: `${labelSector(sectorKey)} emissions` },
+        { name: "units", value: state.chartData?.grid_units ?? "kg km-2 h-1" },
+        { name: "time_key", value: timeKey },
+        { name: "time_mode", value: getTimeMode() },
+        { name: "sector", value: labelSector(sectorKey) },
+      ],
+    },
+  ];
+
+  const varListHeaderSize = 4 + 4;
+  const varSectionTotal = vars.reduce((sum, variable) => (
+    sum + varSectionSize(variable.name, variable.dimIds, variable.attrs)
+  ), 0);
+
+  const headerSize = 4 + 4 + dimSectionSize + globalAttrSectionSize + varListHeaderSize + varSectionTotal;
+
+  let dataOffset = headerSize;
+  for (const variable of vars) {
+    variable.begin = dataOffset;
+    dataOffset += variable.dataBytes;
+  }
+
+  const buffer = new ArrayBuffer(dataOffset);
+  const view = new DataView(buffer);
+  let offset = 0;
+
+  view.setUint8(offset++, "C".charCodeAt(0));
+  view.setUint8(offset++, "D".charCodeAt(0));
+  view.setUint8(offset++, "F".charCodeAt(0));
+  view.setUint8(offset++, 1);
+
+  view.setInt32(offset, 0, false);
+  offset += 4;
+
+  view.setInt32(offset, 10, false);
+  offset += 4;
+  view.setInt32(offset, 2, false);
+  offset += 4;
+
+  offset = writeString(view, offset, "lat");
+  view.setInt32(offset, nlat, false);
+  offset += 4;
+
+  offset = writeString(view, offset, "lon");
+  view.setInt32(offset, nlon, false);
+  offset += 4;
+
+  view.setInt32(offset, 0, false);
+  offset += 4;
+  view.setInt32(offset, 0, false);
+  offset += 4;
+
+  view.setInt32(offset, 11, false);
+  offset += 4;
+  view.setInt32(offset, vars.length, false);
+  offset += 4;
+
+  for (const variable of vars) {
+    offset = writeString(view, offset, variable.name);
+    view.setInt32(offset, variable.dimIds.length, false);
+    offset += 4;
+    variable.dimIds.forEach(dimId => {
+      view.setInt32(offset, dimId, false);
+      offset += 4;
     });
+
+    view.setInt32(offset, 12, false);
+    offset += 4;
+    view.setInt32(offset, variable.attrs.length, false);
+    offset += 4;
+    variable.attrs.forEach(attr => {
+      offset = writeCharAttr(view, offset, attr.name, attr.value);
+    });
+
+    view.setInt32(offset, variable.type, false);
+    offset += 4;
+    view.setInt32(offset, variable.dataBytes, false);
+    offset += 4;
+    view.setInt32(offset, variable.begin, false);
+    offset += 4;
+  }
+
+  let dataPos = vars[0].begin;
+  lats.forEach(value => {
+    view.setFloat64(dataPos, value, false);
+    dataPos += 8;
   });
+
+  dataPos = vars[1].begin;
+  lons.forEach(value => {
+    view.setFloat64(dataPos, value, false);
+    dataPos += 8;
+  });
+
+  dataPos = vars[2].begin;
+  field.forEach(value => {
+    view.setFloat32(dataPos, value, false);
+    dataPos += 4;
+  });
+
+  return new Blob([buffer], { type: "application/x-netcdf" });
 }
 
-function deriveSectorsFromRow(row) {
-  return Object.keys(row)
-    .filter(k => k.endsWith(SCENARIO_SUFFIX))
-    .map(k => k.replace(SCENARIO_SUFFIX, ""))
-    .filter(s => s !== "Total")
-    .filter(s => !EXCLUDED_SECTORS.includes(s))
-    .sort();
+function getViewMode() {
+  const el = document.querySelector('input[name="viewMode"]:checked');
+  return el ? el.value : "colombia";
 }
 
-async function loadStateCSVs() {
-  for (const y of YEARS) {
-    const rows = await fetchCSV(CSV_PATH(y));
-    state.dataByYear[y] = {};
+function getTimeMode() {
+  return "annual";
+}
 
-    for (const r of rows) {
-      const name = r.State?.trim();
-      if (name) state.dataByYear[y][name] = r;
-    }
+function getSeriesStore() {
+  return state.chartData.annual;
+}
 
-    if (state.sectorKeys.length === 0 && rows.length > 0) {
-      state.sectorKeys = deriveSectorsFromRow(rows[0]);
-    }
+function getTimeKeys() {
+  const store = getSeriesStore();
+  return store.years ?? [];
+}
+
+function getSelectedTimeKey() {
+  return state.el.timeSelect?.value ?? "";
+}
+
+function formatPlaceName(name) {
+  if (!name) return name;
+  return String(name)
+    .toLowerCase()
+    .replace(/\b([a-z])/g, match => match.toUpperCase());
+}
+
+function normalizePlaceKey(name) {
+  return String(name ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^A-Za-z0-9]+/g, " ")
+    .trim()
+    .toUpperCase();
+}
+
+function resolveProvinceKey(name) {
+  if (!name) return null;
+  const provinces = state.chartData?.annual?.provinces ?? {};
+  if (name in provinces) return name;
+
+  const normalizedTarget = normalizePlaceKey(name);
+  for (const key of Object.keys(provinces)) {
+    if (normalizePlaceKey(key) === normalizedTarget) return key;
+  }
+  return null;
+}
+
+function getCurrentPlaceLabel() {
+  const viewMode = getViewMode();
+  if (viewMode === "colombia") return "Colombia";
+  if (viewMode === "province") return state.selectedProvince ? formatPlaceName(state.selectedProvince) : "(none)";
+  return "(none)";
+}
+
+function currentSelectionIsValid() {
+  const viewMode = getViewMode();
+  if (viewMode === "colombia") return true;
+  if (viewMode === "province") return !!state.selectedProvince;
+  return false;
+}
+
+function getProvinceName(feature) {
+  const props = feature?.properties ?? {};
+  for (const key of PROVINCE_NAME_KEYS) {
+    if (props[key] != null && String(props[key]).trim()) return String(props[key]).trim();
+  }
+  return null;
+}
+
+function syncSelectedLabel() {
+  if (state.el.selectedRegion) {
+    state.el.selectedRegion.textContent = getCurrentPlaceLabel();
   }
 }
 
-async function loadNationalCSVs() {
-  const rowsPost = await fetchCSV(NATIONAL_CSV_PATH);
-  state.nationalPosteriorByYear = {};
-  for (const r of rowsPost) {
-    const y = Number(r.Year);
-    if (Number.isFinite(y)) state.nationalPosteriorByYear[y] = r;
-  }
-
-  const rowsPrior = await fetchCSV(NATIONAL_CSV_PATH_PRIOR);
-  state.nationalPriorByYear = {};
-  for (const r of rowsPrior) {
-    const y = Number(r.Year);
-    if (Number.isFinite(y)) state.nationalPriorByYear[y] = r;
-  }
+function syncActiveMapLayer() {
+  state.gridLayer?.bringToBack();
+  state.provinceLayer?.bringToFront();
 }
 
-function hasUncertainty(emisSource) {
-  return emisSource !== "ghgi";
+function setDataHint() {
+  if (!state.el.dataHint) return;
+  const viewMode = getViewMode();
+
+  let msg = "The emissions field and charts are loaded directly from chart_data.json.";
+  msg += " The bar chart summarizes the selected year, and the trend chart shows annual change through time.";
+  msg += viewMode === "province"
+    ? " Click a department boundary to update the charts."
+    : " Colombia-wide totals are shown while the gridded emissions field remains visible.";
+
+  state.el.dataHint.textContent = msg;
 }
 
-/* ===================== STATE OUTLINES ===================== */
-
-function makeChoroplethStyle(year, feature) {
-  const props = feature.properties || {};
-  const name = props.name || props.NAME || props.STATE_NAME;
-
-  const row = state.dataByYear?.[year]?.[name];
-  const emisSource = getEmisSource();
-  const v = row ? parseNumber(row[mapValueCol(emisSource)]) : null;
-
+function makeValueRange(obj) {
+  if (!obj || typeof obj !== "object") {
+    return { value: null, min: null, max: null };
+  }
   return {
-    color: STATES_LINE_COLOR,
-    weight: STATES_LINE_WEIGHT,
-    fillColor: (v == null) ? "#00000000" : "#3388ff",
-    fillOpacity: (v == null) ? 0.0 : STATES_FILL_OPACITY,
+    value: Number.isFinite(obj.value) ? obj.value : null,
+    min: Number.isFinite(obj.min) ? obj.min : null,
+    max: Number.isFinite(obj.max) ? obj.max : null,
   };
 }
 
-function recolorStates() {
-  if (!state.statesLayer) return;
-
-  const year = Number(state.el.yearSelect.value);
-  state.statesLayer.setStyle((feature) => makeChoroplethStyle(year, feature));
-
-  if (!state.selectedState) return;
-
-  state.statesLayer.eachLayer(layer => {
-    const props = layer.feature?.properties || {};
-    const name = props.name || props.NAME || props.STATE_NAME;
-    if (name === state.selectedState) layer.setStyle({ weight: 2, color: "#000" });
-  });
+async function fetchJSON(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Failed to fetch ${url}`);
+  return res.json();
 }
 
-function hideStatesOverlay() {
-  if (state.statesLayer && state.map?.hasLayer(state.statesLayer)) {
-    state.map.removeLayer(state.statesLayer);
-  }
+async function ensureChartDataLoaded() {
+  if (state.chartData) return;
+
+  state.chartData = await fetchJSON(CHART_DATA_PATH);
+  state.sectors = state.chartData.sectors ?? [];
+  state.gridMeta = state.chartData.grid ?? null;
+  state.provinceNames = Object.keys(state.chartData.annual?.provinces ?? {}).sort();
 }
 
-function showStatesOverlay() {
-  if (state.statesLayer && state.map && !state.map.hasLayer(state.statesLayer)) {
-    state.statesLayer.addTo(state.map);
-    state.statesLayer.bringToFront();
-  }
+function getGridUnitsHtml() {
+  const units = state.chartData?.grid_units;
+  return units === "kg km-2 h-1" ? GRID_UNITS_HTML : (units ?? GRID_UNITS_HTML);
 }
 
-/* ===================== GRID OVERLAY ===================== */
-
-function getGlobalDomainForGridVar(gridVar) {
-  // Cache so we don't rescan every time
-  if (state.gridVarDomainCache?.[gridVar]) return state.gridVarDomainCache[gridVar];
-
-  const entries = state.gridManifest?.data?.[gridVar];
-  if (!entries) return null;
-
-  let gMin = Infinity;
-  let gMax = -Infinity;
-
-  for (const key of Object.keys(entries)) {
-    const e = entries[key];
-    if (!e) continue;
-
-    const mn = Number(e.min);
-    const mx = Number(e.max);
-    if (Number.isFinite(mn)) gMin = Math.min(gMin, mn);
-    if (Number.isFinite(mx)) gMax = Math.max(gMax, mx);
+function getGridBounds() {
+  const grid = state.gridMeta;
+  if (!grid?.lats?.length || !grid?.lons?.length) {
+    return L.latLngBounds([[-6.5, -80.8], [14.8, -66.5]]);
   }
 
-  if (!Number.isFinite(gMin) || !Number.isFinite(gMax) || gMax <= gMin) return null;
+  const lats = grid.lats;
+  const lons = grid.lons;
+  const dlat = lats.length > 1 ? Math.abs(lats[1] - lats[0]) : 0.25;
+  const dlon = lons.length > 1 ? Math.abs(lons[1] - lons[0]) : 0.25;
 
-  const dom = { min: gMin, max: gMax };
-  state.gridVarDomainCache[gridVar] = dom;
-  return dom;
+  const south = Math.min(...lats) - dlat / 2;
+  const north = Math.max(...lats) + dlat / 2;
+  const west = Math.min(...lons) - dlon / 2;
+  const east = Math.max(...lons) + dlon / 2;
+  return L.latLngBounds([[south, west], [north, east]]);
 }
 
-function gridVarForSector(sectorKey) {
-  return GRID_VAR_BY_SECTOR[sectorKey] ?? "EmisCH4_Total";
+function getSelectionEntry(timeKey) {
+  const store = getSeriesStore();
+  const viewMode = getViewMode();
+
+  if (viewMode === "colombia") {
+    return store.colombia?.[timeKey] ?? null;
+  }
+  if (viewMode === "province") {
+    const provinceKey = resolveProvinceKey(state.selectedProvince);
+    return provinceKey ? store.provinces?.[provinceKey]?.[timeKey] ?? null : null;
+  }
+  return null;
 }
 
-function getColorbarReferenceEntry(gridVar, year) {
-  // Always use GHGI+TROPOMI entry (no "_prior") for colorbar min/max domain
-  return state.gridManifest?.data?.[gridVar]?.[String(year)] ?? null;
+function aggregateRange(entry, displaySectorKey) {
+  if (!entry) return { value: null, min: null, max: null };
+
+  const sectorKeys = DISPLAY_SECTOR_MAP[displaySectorKey] ?? [displaySectorKey];
+  let value = 0;
+  let min = 0;
+  let max = 0;
+  let hasValue = false;
+  let hasMin = false;
+  let hasMax = false;
+
+  for (const key of sectorKeys) {
+    const vr = makeValueRange(entry[key]);
+    if (Number.isFinite(vr.value)) {
+      value += vr.value;
+      hasValue = true;
+    }
+    if (Number.isFinite(vr.min)) {
+      min += vr.min;
+      hasMin = true;
+    }
+    if (Number.isFinite(vr.max)) {
+      max += vr.max;
+      hasMax = true;
+    }
+  }
+
+  return {
+    value: hasValue ? value : null,
+    min: hasMin ? min : null,
+    max: hasMax ? max : null,
+  };
 }
 
-async function ensureGridManifestLoaded() {
-  if (state.gridManifest) return;
-  state.gridManifest = await (await fetch(GRID_MANIFEST_PATH)).json();
+function getGridStoreForTime(timeKey) {
+  const store = getSeriesStore();
+  return store.maps?.[timeKey] ?? null;
+}
+
+function aggregateMapValues(gridStore, displaySectorKey) {
+  const sectorKeys = DISPLAY_SECTOR_MAP[displaySectorKey] ?? [displaySectorKey];
+  const arrays = sectorKeys.map(key => gridStore?.[key]).filter(Boolean);
+  if (!arrays.length) return null;
+
+  const length = arrays[0].length;
+  const out = new Array(length).fill(null);
+
+  for (let i = 0; i < length; i++) {
+    let sum = 0;
+    let hasFinite = false;
+    for (const arr of arrays) {
+      const value = arr[i];
+      if (Number.isFinite(value)) {
+        sum += value;
+        hasFinite = true;
+      }
+    }
+    out[i] = hasFinite ? sum : null;
+  }
+
+  return out;
 }
 
 function getGridOpacity() {
-  const el = state.el.gridOpacitySlider;
-  if (!el) return GRID_OPACITY;
-  const v = Number(el.value);
+  const v = Number(state.el.gridOpacitySlider?.value);
   return Number.isFinite(v) ? Math.max(0, Math.min(1, v / 100)) : GRID_OPACITY;
 }
 
 function syncGridOpacityUI() {
-  const el = state.el.gridOpacitySlider;
-  const out = state.el.gridOpacityValue;
-  if (!el || !out) return;
-  out.textContent = `${Math.round(getGridOpacity() * 100)}%`;
+  if (state.el.gridOpacityValue) {
+    state.el.gridOpacityValue.textContent = `${Math.round(getGridOpacity() * 100)}%`;
+  }
 }
 
 function applyGridOpacity() {
   state.gridOpacity = getGridOpacity();
   syncGridOpacityUI();
-  if (state.gridLayer && typeof state.gridLayer.setOpacity === "function") {
-    state.gridLayer.setOpacity(state.gridOpacity);
-  } else if (state.gridLayer?.options) {
-    // fallback for implementations without setOpacity
-    state.gridLayer.options.opacity = state.gridOpacity;
-    state.gridLayer.redraw?.();
+  if (state.gridLayer) {
+    state.gridLayer.setStyle(feature => gridFeatureStyle(feature));
   }
 }
 
-function clearGrid() {
-  if (state.gridLayer) state.map.removeLayer(state.gridLayer);
-  state.gridLayer = null;
-  state.gridGeoraster = null;
-  state.currentGridEntry = null;
-  state.currentGridVar = null;
-  updateGridLegend();
-  syncGridSliderToEntry();
+function currentGridMax() {
+  return Number.isFinite(state.gridDisplayMax) ? state.gridDisplayMax : state.gridMaxValueRaw;
 }
 
-function getEffectiveGridMax() {
-  const dom = state.currentGridVar ? getGlobalDomainForGridVar(state.currentGridVar) : null;
-  if (!dom) return null;
-
-  const maxRaw = Number(dom.max ?? 1);
-  return (state.gridDisplayMax != null) ? Number(state.gridDisplayMax) : maxRaw;
-}
-
-function syncGridSliderToEntry() {
+function syncGridSlider() {
   const slider = state.el.gridMaxSlider;
   const out = state.el.gridMaxValue;
+  if (!slider || !out) return;
 
-  if (!slider || !out || !state.currentGridEntry || !state.currentGridVar) return;
-
-  const dom = getGlobalDomainForGridVar(state.currentGridVar);
-  if (!dom) {
+  if (!Number.isFinite(state.gridMaxValueRaw) || state.gridMaxValueRaw <= 0) {
     slider.disabled = true;
-    out.textContent = "";
+    out.innerHTML = "";
     return;
   }
 
-  const dataMin = dom.min;
-  const dataMax = dom.max;
-
   slider.disabled = false;
 
-  // Only initialize if user hasn't set it yet
-  if (state.gridDisplayMax == null) state.gridDisplayMax = dataMax;
+  if (!Number.isFinite(state.gridDisplayMax)) {
+    state.gridDisplayMax = state.gridMaxValueRaw;
+  }
 
-  // Clamp within global domain
-  state.gridDisplayMax = Math.max(dataMin, Math.min(dataMax, state.gridDisplayMax));
+  state.gridDisplayMax = Math.max(state.gridMinValue, Math.min(state.gridMaxValueRaw, state.gridDisplayMax));
+  const denom = (state.gridMaxValueRaw - state.gridMinValue) || 1;
+  const t = (state.gridDisplayMax - state.gridMinValue) / denom;
+  slider.value = String(Math.round(Math.max(0, Math.min(1, t)) * 1000));
+  out.innerHTML = `${fmt(state.gridDisplayMax)} ${getGridUnitsHtml()}`;
+}
 
-  state.gridMaxT = (state.gridDisplayMax - dataMin) / (dataMax - dataMin);
-  state.gridMaxT = Math.max(0, Math.min(1, state.gridMaxT));
+function handleGridSliderInput() {
+  if (!Number.isFinite(state.gridMaxValueRaw)) return;
+  const rawT = Number(state.el.gridMaxSlider.value) / 1000;
+  const denom = (state.gridMaxValueRaw - state.gridMinValue) || 1;
+  state.gridDisplayMax = state.gridMinValue + rawT * denom;
 
-  slider.value = String(Math.round(state.gridMaxT * 1000));
-  out.innerHTML = `${fmt(state.gridDisplayMax)} ${GRID_UNITS_HTML}`;
+  if (state.el.gridMaxValue) {
+    state.el.gridMaxValue.innerHTML = `${fmt(state.gridDisplayMax)} ${getGridUnitsHtml()}`;
+  }
+
+  if (state.gridLayer) state.gridLayer.setStyle(feature => gridFeatureStyle(feature));
+  updateGridLegend();
 }
 
 function updateGridLegend() {
   const ctl = state.gridLegendControl;
   if (!ctl?._container) return;
-
-  if (!state.currentGridEntry || !state.currentGridVar) {
+  if (!state.gridLayer) {
     ctl._container.innerHTML = "";
     return;
   }
 
-  const dom = getGlobalDomainForGridVar(state.currentGridVar);
-  if (!dom) {
+  const min = Number.isFinite(state.gridMinValue) ? state.gridMinValue : 0;
+  const max = currentGridMax();
+  if (!Number.isFinite(max)) {
     ctl._container.innerHTML = "";
     return;
   }
 
-  const min = dom.min;
-  const max = getEffectiveGridMax();
-
-  const steps = 40;
   const colors = [];
-  for (let i = 0; i < steps; i++) {
-    colors.push(chroma.scale(GRID_COLORMAP)(i / (steps - 1)).hex());
+  for (let i = 0; i < 40; i++) {
+    colors.push(chroma.scale(GRID_COLORMAP)(i / 39).hex());
   }
   const gradient = `linear-gradient(to right, ${colors.join(",")})`;
-
-  const sectorKey =
-    Object.keys(GRID_VAR_BY_SECTOR).find(k => GRID_VAR_BY_SECTOR[k] === state.currentGridVar) ??
-    DEFAULT_SECTOR;
+  const sectorKey = state.el.sectorSelect?.value ?? DEFAULT_SECTOR;
 
   ctl._container.innerHTML = `
     <div class="legend">
       <div class="title">${labelSector(sectorKey)}</div>
-      <div class="units">${GRID_UNITS_HTML}</div>
+      <div class="units">${getGridUnitsHtml()}</div>
       <div class="bar" style="background:${gradient};"></div>
       <div class="labels">
         <span>${fmt(min)}</span>
@@ -548,100 +720,214 @@ function updateGridLegend() {
   `;
 }
 
-async function setGridLayerForSelection() {
-  await ensureGridManifestLoaded();
+function buildGridCells() {
+  const grid = state.gridMeta;
+  if (!grid?.lats?.length || !grid?.lons?.length) {
+    throw new Error("Missing grid metadata in chart_data.json");
+  }
 
-  const year = Number(state.el.yearSelect.value);
+  const lats = grid.lats;
+  const lons = grid.lons;
+  const nlat = lats.length;
+  const nlon = lons.length;
+
+  const dlat = nlat > 1 ? Math.abs(lats[1] - lats[0]) : 0.25;
+  const dlon = nlon > 1 ? Math.abs(lons[1] - lons[0]) : 0.25;
+
+  const cells = [];
+  for (let i = 0; i < nlat; i++) {
+    for (let j = 0; j < nlon; j++) {
+      const lat = Number(lats[i]);
+      const lon = Number(lons[j]);
+      const lat0 = lat - dlat / 2;
+      const lat1 = lat + dlat / 2;
+      const lon0 = lon - dlon / 2;
+      const lon1 = lon + dlon / 2;
+
+      cells.push({
+        type: "Feature",
+        properties: {
+          lat_idx: i,
+          lon_idx: j,
+          flatIndex: i * nlon + j,
+          lat,
+          lon,
+          value: null,
+        },
+        geometry: {
+          type: "Polygon",
+          coordinates: [[
+            [lon0, lat0],
+            [lon1, lat0],
+            [lon1, lat1],
+            [lon0, lat1],
+            [lon0, lat0],
+          ]],
+        },
+      });
+    }
+  }
+  return cells;
+}
+
+function getFeatureMapValue(feature) {
+  const n = Number(feature?.properties?.value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function gridFeatureStyle(feature) {
+  const value = getFeatureMapValue(feature);
+  const max = currentGridMax();
+  const min = Number.isFinite(state.gridMinValue) ? state.gridMinValue : 0;
+  let fillColor = "#00000000";
+
+  if (value != null && Number.isFinite(max) && max > min) {
+    const t = Math.max(0, Math.min(1, (value - min) / ((max - min) || 1)));
+    fillColor = chroma.scale(GRID_COLORMAP)(t).hex();
+  }
+
+  return {
+    color: "rgba(82, 107, 145, 0.30)",
+    weight: 0.18,
+    fillColor,
+    fillOpacity: value == null ? 0 : getGridOpacity(),
+  };
+}
+
+function provinceFeatureStyle(feature) {
+  const name = getProvinceName(feature);
+  const isSelected = getViewMode() === "province"
+    && normalizePlaceKey(name) === normalizePlaceKey(state.selectedProvince);
+  const isProvinceMode = getViewMode() === "province";
+
+  return {
+    color: isSelected ? "#1341a3" : "#486487",
+    weight: isSelected ? 2.2 : (isProvinceMode ? 1.3 : 1),
+    fillColor: isSelected ? "#4e83ff" : "#b3cbff",
+    fillOpacity: isSelected ? 0.16 : (isProvinceMode ? 0.05 : 0),
+  };
+}
+
+function clearGridLayer() {
+  if (state.gridLayer && state.map?.hasLayer(state.gridLayer)) {
+    state.map.removeLayer(state.gridLayer);
+  }
+  state.gridLayer = null;
+  state.gridMinValue = GRID_MIN_VALUE;
+  state.gridMaxValueRaw = null;
+  state.gridDisplayMax = null;
+  updateGridLegend();
+  syncGridSlider();
+}
+
+async function updateMapOverlay() {
+  const timeKey = getSelectedTimeKey();
   const sectorKey = state.el.sectorSelect.value;
-  const gridVar = gridVarForSector(sectorKey);
 
-  const emisSource = getEmisSource();
-  const yearKey = (emisSource === "ghgi") ? `${year}_prior` : String(year);
-
-  const entry = state.gridManifest?.data?.[gridVar]?.[yearKey];
-  if (!entry) {
-    console.warn("No GeoTIFF entry for", { gridVar, yearKey, sectorKey });
-    state.currentGridEntry = null;
-    state.currentGridVar = null;
-    syncGridSliderToEntry();
-    updateGridLegend();
+  if (!timeKey || !sectorKey) {
+    clearGridLayer();
     return;
   }
 
-  // remove old layer
-  if (state.gridLayer) {
-    state.map.removeLayer(state.gridLayer);
-    state.gridLayer = null;
-    state.gridGeoraster = null;
+  const gridStore = getGridStoreForTime(timeKey);
+  const values = aggregateMapValues(gridStore, sectorKey);
+  if (!values?.length) {
+    clearGridLayer();
+    return;
   }
 
-  state.currentGridEntry = entry;
-  state.currentGridVar = gridVar;
+  if (state.gridLayer && state.map?.hasLayer(state.gridLayer)) {
+    state.map.removeLayer(state.gridLayer);
+  }
 
-  // reference entry ALWAYS posterior for slider + legend + colormap scaling
-  state.colorbarRefEntry = getColorbarReferenceEntry(gridVar, year) || entry;
-
-  const resp = await fetch(entry.tif);
-  const arrayBuffer = await resp.arrayBuffer();
-  const georaster = await parseGeoraster(arrayBuffer);
-  state.gridGeoraster = georaster;
-
-  state.gridLayer = new GeoRasterLayer({
-    georaster,
-    opacity: getGridOpacity(),
-    resolution: GRID_RESOLUTION,
-    pixelValuesToColorFn: (vals) => {
-      const v = vals?.[0];
-      if (v == null || Number.isNaN(v)) return null;
-
-      const dom = state.currentGridVar ? getGlobalDomainForGridVar(state.currentGridVar) : null;
-      const min = Number(dom?.min ?? 0);
-      const max = getEffectiveGridMax();
-      const denom = (max - min) || 1;
-
-      const t = Math.max(0, Math.min(1, (v - min) / denom));
-      return chroma.scale(GRID_COLORMAP)(t).hex();
-    },
+  const cells = state.currentGridCells.map(feature => {
+    const value = values[feature.properties.flatIndex];
+    return {
+      ...feature,
+      properties: {
+        ...feature.properties,
+        value: Number.isFinite(value) ? value : null,
+      },
+    };
   });
 
-  state.gridLayer.addTo(state.map);
+  const finiteValues = values.filter(Number.isFinite);
+  state.gridMinValue = GRID_MIN_VALUE;
+  state.gridMaxValueRaw = finiteValues.length ? Math.max(...finiteValues) : null;
+  state.gridDisplayMax = Number.isFinite(state.gridMaxValueRaw) && state.gridMaxValueRaw > state.gridMinValue
+    ? state.gridMinValue + GRID_DEFAULT_SLIDER_FRACTION * (state.gridMaxValueRaw - state.gridMinValue)
+    : state.gridMaxValueRaw;
+  syncGridSlider();
 
-  if (getChartMode() === "state" && state.statesLayer) state.statesLayer.bringToFront();
+  state.gridLayer = L.geoJSON({ type: "FeatureCollection", features: cells }, {
+    pane: "gridPane",
+    interactive: false,
+    style: feature => gridFeatureStyle(feature),
+  }).addTo(state.map);
 
-  syncGridSliderToEntry();
+  syncActiveMapLayer();
   updateGridLegend();
 }
 
-function handleGridSliderInput() {
-  if (!state.currentGridVar) return;
+async function initMap() {
+  const gridBounds = getGridBounds();
 
-  const dom = getGlobalDomainForGridVar(state.currentGridVar);
-  if (!dom) return;
+  state.map = L.map("map", {
+    maxBounds: gridBounds,
+    maxBoundsViscosity: 1,
+    zoomSnap: 0.25,
+    zoomDelta: 0.5,
+  });
 
-  const dataMin = dom.min;
-  const dataMax = dom.max;
+  state.map.createPane("gridPane");
+  state.map.createPane("provincePane");
+  state.map.getPane("gridPane").style.zIndex = "410";
+  state.map.getPane("provincePane").style.zIndex = "420";
 
-  state.gridMaxT = Number(state.el.gridMaxSlider.value) / 1000;
-  state.gridDisplayMax = dataMin + state.gridMaxT * (dataMax - dataMin);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 12,
+    attribution: "&copy; OpenStreetMap contributors",
+  }).addTo(state.map);
 
-  state.el.gridMaxValue.innerHTML = `${fmt(state.gridDisplayMax)} ${GRID_UNITS_HTML}`;
+  state.currentGridCells = buildGridCells();
 
-  state.gridLayer?.redraw?.();
-  updateGridLegend();
+  state.provinceLayer = L.geoJSON(state.chartData.province_geojson, {
+    pane: "provincePane",
+    style: feature => provinceFeatureStyle(feature),
+    onEachFeature: (feature, layer) => {
+      layer.on("click", async () => {
+        if (getViewMode() !== "province") return;
+        const name = getProvinceName(feature);
+        if (!name) return;
+        state.selectedProvince = resolveProvinceKey(name) ?? name;
+        syncSelectedLabel();
+        if (state.provinceLayer) state.provinceLayer.setStyle(f => provinceFeatureStyle(f));
+        await updateCharts();
+      });
+    },
+  }).addTo(state.map);
+
+  state.gridLegendControl = L.control({ position: "bottomright" });
+  state.gridLegendControl.onAdd = function () {
+    const div = L.DomUtil.create("div");
+    div.className = "legend";
+    div.innerHTML = "";
+    return div;
+  };
+  state.gridLegendControl.addTo(state.map);
+  L.DomEvent.disableClickPropagation(state.gridLegendControl.getContainer());
+  syncActiveMapLayer();
+  const fitPadding = L.point(8, 8);
+  state.map.fitBounds(gridBounds, { padding: fitPadding });
+  state.map.setMinZoom(state.map.getBoundsZoom(gridBounds, false, fitPadding));
+  state.map.setZoom(state.map.getZoom() + 0.5);
 }
 
-/* ===================== CHARTS ===================== */
-
-// Draw bar error bars using dataset[0]._errMin/_errMax
 const barErrorBarsPlugin = {
   id: "barErrorBars",
   afterDatasetsDraw(chart) {
-    const emisSource = getEmisSource();
-    if (!hasUncertainty(emisSource)) return;
-
     const meta = chart.getDatasetMeta(0);
     if (!meta?.data?.length) return;
-
     const ds = chart.data.datasets[0];
     const mins = ds._errMin || [];
     const maxs = ds._errMax || [];
@@ -655,7 +941,6 @@ const barErrorBarsPlugin = {
       const yMin = mins[i];
       const yMax = maxs[i];
       if (yMin == null || yMax == null || Number.isNaN(yMin) || Number.isNaN(yMax)) return;
-
       const x = barElem.x;
       const yTop = chart.scales.y.getPixelForValue(yMax);
       const yBot = chart.scales.y.getPixelForValue(yMin);
@@ -670,76 +955,160 @@ const barErrorBarsPlugin = {
   },
 };
 
-function getRowFor(mode, year) {
-  if (mode === "national") {
-    const emisSource = getEmisSource();
-    return (emisSource === "ghgi")
-      ? (state.nationalPriorByYear?.[year] ?? null)
-      : (state.nationalPosteriorByYear?.[year] ?? null);
-  }
+function initCharts() {
+  state.barChart = new Chart(state.el.barChart, {
+    type: "bar",
+    data: {
+      labels: [],
+      datasets: [{ label: "Emissions", data: [], _errMin: [], _errMax: [] }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        title: {
+          display: true,
+          text: "Select a place",
+          font: { size: 14, weight: "700" },
+          padding: { bottom: 14 },
+        },
+        legend: { display: false },
+      },
+      scales: {
+        x: {
+          ticks: {
+            minRotation: 0,
+            maxRotation: 0,
+            autoSkip: false,
+            font: { size: 11 },
+            padding: 10,
+          },
+        },
+        y: {
+          beginAtZero: true,
+          ticks: {
+            font: { size: 11 },
+            padding: 6,
+          },
+          title: {
+            display: true,
+            text: `Emissions (${state.unitLabel})`,
+            font: { size: 12, weight: "600" },
+            padding: { bottom: 8 },
+          },
+        },
+      },
+    },
+    plugins: [barErrorBarsPlugin],
+  });
+  state.barChart.data.datasets[0].backgroundColor = "rgba(58, 123, 213, 0.72)";
+  state.barChart.data.datasets[0].borderColor = "rgba(23, 74, 153, 0.95)";
+  state.barChart.data.datasets[0].borderWidth = 1;
 
-  if (!state.selectedState) return null;
-  return state.dataByYear?.[year]?.[state.selectedState] ?? null;
+  state.lineChart = new Chart(state.el.lineChart, {
+    type: "line",
+    data: {
+      labels: [],
+      datasets: [
+        { label: "min", data: [], pointRadius: 0, borderWidth: 0 },
+        { label: "max", data: [], pointRadius: 0, borderWidth: 0, fill: "-1", backgroundColor: "rgba(85, 140, 233, 0.16)" },
+        { label: "Value", data: [], tension: 0.2, pointRadius: 2, borderColor: "#1a56c8", backgroundColor: "#1a56c8" },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        title: {
+          display: true,
+          text: "",
+          font: { size: 14, weight: "700" },
+          padding: { bottom: 14 },
+        },
+        legend: { display: false },
+      },
+      scales: {
+        x: {
+          ticks: {
+            font: { size: 11 },
+            maxRotation: 0,
+            padding: 8,
+          },
+        },
+        y: {
+          beginAtZero: true,
+          ticks: {
+            font: { size: 11 },
+            padding: 6,
+          },
+          title: {
+            display: true,
+            text: `Emissions (${state.unitLabel})`,
+            font: { size: 12, weight: "600" },
+            padding: { bottom: 8 },
+          },
+        },
+      },
+    },
+  });
 }
 
-function buildBarData(year, mode, emisSource) {
-  const row = getRowFor(mode, year);
-  if (!row) return { labels: [], values: [], mins: [], maxs: [] };
+async function buildBarData() {
+  const timeKey = getSelectedTimeKey();
+  const entry = getSelectionEntry(timeKey);
 
-  const labels = state.sectorKeys;
-  const values = labels.map(s => scaleVal(parseNumber(row[centralCol(s, mode, emisSource)])));
+  if (!entry) return { labels: [], values: [], mins: [], maxs: [] };
 
-  if (!hasUncertainty(emisSource)) {
+  const rows = BAR_DISPLAY_SECTORS.map(label => {
+    const range = aggregateRange(entry, label);
     return {
-      labels,
-      values,
-      mins: labels.map(() => null),
-      maxs: labels.map(() => null),
+      label,
+      value: scaleVal(range.value),
+      min: scaleVal(range.min),
+      max: scaleVal(range.max),
     };
-  }
+  });
+
+  rows.sort((a, b) => {
+    const aVal = Number.isFinite(a.value) ? a.value : Number.NEGATIVE_INFINITY;
+    const bVal = Number.isFinite(b.value) ? b.value : Number.NEGATIVE_INFINITY;
+    return bVal - aVal;
+  });
 
   return {
-    labels,
-    values,
-    mins: labels.map(s => scaleVal(parseNumber(row[minCol(s)]))),
-    maxs: labels.map(s => scaleVal(parseNumber(row[maxCol(s)]))),
+    labels: rows.map(row => row.label),
+    values: rows.map(row => row.value),
+    mins: rows.map(row => row.min),
+    maxs: rows.map(row => row.max),
   };
 }
 
-function buildLineData(mode, sectorKey, emisSource) {
-  const yrs = activeYears(emisSource);
-  const labels = yrs.map(String);
+async function buildLineData() {
+  const sectorKey = state.el.sectorSelect.value;
+  const timeKeys = getTimeKeys();
+  const labels = [...timeKeys];
+  const values = [];
+  const mins = [];
+  const maxs = [];
 
-  const values = yrs.map(y => {
-    const row = getRowFor(mode, y);
-    return row ? scaleVal(parseNumber(row[centralCol(sectorKey, mode, emisSource)])) : null;
-  });
-
-  if (!hasUncertainty(emisSource)) {
-    return { labels, values, mins: labels.map(() => null), maxs: labels.map(() => null) };
+  for (const timeKey of timeKeys) {
+    const entry = getSelectionEntry(timeKey);
+    const vr = aggregateRange(entry, sectorKey);
+    values.push(scaleVal(vr.value));
+    mins.push(scaleVal(vr.min));
+    maxs.push(scaleVal(vr.max));
   }
-
-  const mins = yrs.map(y => {
-    const row = getRowFor(mode, y);
-    return row ? scaleVal(parseNumber(row[minCol(sectorKey)])) : null;
-  });
-
-  const maxs = yrs.map(y => {
-    const row = getRowFor(mode, y);
-    return row ? scaleVal(parseNumber(row[maxCol(sectorKey)])) : null;
-  });
 
   return { labels, values, mins, maxs };
 }
 
 function clearCharts() {
   if (!state.barChart || !state.lineChart) return;
-
   state.barChart.data.labels = [];
   state.barChart.data.datasets[0].data = [];
   state.barChart.data.datasets[0]._errMin = [];
   state.barChart.data.datasets[0]._errMax = [];
-  state.barChart.options.plugins.title.text = "Click a state";
+  state.barChart.options.plugins.title.text = "Select a place";
   state.barChart.update();
 
   state.lineChart.data.labels = [];
@@ -750,39 +1119,19 @@ function clearCharts() {
   state.lineChart.update();
 }
 
-function syncChartTitles() {
-  const emisSource = getEmisSource();
-  const suffix = emisSourceLabel(emisSource);
-
-  if (state.el.barChartTitleText) {
-    state.el.barChartTitleText.textContent = `Sector breakdown (${suffix})`;
-  }
-  if (state.el.lineChartTitle) state.el.lineChartTitle.textContent = `Timeseries (${suffix})`;
-
-  if (state.barChart?.data?.datasets?.[0]) state.barChart.data.datasets[0].label = suffix;
-  if (state.lineChart?.data?.datasets?.[2]) state.lineChart.data.datasets[2].label = suffix;
-}
-
-function updateCharts() {
-  const mode = getChartMode();
-  const emisSource = getEmisSource();
-  const year = Number(state.el.yearSelect.value);
-  const sectorKey = state.el.sectorSelect.value;
-  const place = currentPlaceLabel(mode);
-
-  syncChartTitles();
-  updateDataHint();
-
-  state.el.selectedState.textContent = (mode === "national")
-    ? "National"
-    : (state.selectedState ?? "(none)");
-
+async function updateCharts() {
+  syncSelectedLabel();
+  setDataHint();
   if (!state.barChart || !state.lineChart) return;
-  if (mode === "state" && !state.selectedState) return clearCharts();
+  if (!currentSelectionIsValid()) return clearCharts();
 
-  // BAR
-  const bar = buildBarData(year, mode, emisSource);
-  state.barChart.data.labels = bar.labels.map(labelSector);
+  const timeKey = getSelectedTimeKey();
+  const sectorKey = state.el.sectorSelect.value;
+  const place = getCurrentPlaceLabel();
+  const timeMode = getTimeMode();
+
+  const bar = await buildBarData();
+  state.barChart.data.labels = bar.labels.map(wrapSectorLabel);
   state.barChart.data.datasets[0].data = bar.values;
   state.barChart.data.datasets[0]._errMin = bar.mins;
   state.barChart.data.datasets[0]._errMax = bar.maxs;
@@ -790,229 +1139,158 @@ function updateCharts() {
   const finiteVals = bar.values.filter(Number.isFinite);
   const finiteMins = bar.mins.filter(Number.isFinite);
   const finiteMaxs = bar.maxs.filter(Number.isFinite);
-
   const overallMin = finiteMins.length ? Math.min(...finiteMins) : 0;
-  const overallMax = finiteMaxs.length
-    ? Math.max(...finiteMaxs)
-    : (finiteVals.length ? Math.max(...finiteVals) : 1);
-
-  const lim = getNiceLimits(overallMin, overallMax);
-  state.barChart.options.scales.y.min = lim.min;
-  state.barChart.options.scales.y.max = lim.max;
+  const overallMax = finiteMaxs.length ? Math.max(...finiteMaxs) : (finiteVals.length ? Math.max(...finiteVals) : 1);
+  const barLimits = getNiceLimits(overallMin, overallMax);
+  state.barChart.options.scales.y.min = barLimits.min;
+  state.barChart.options.scales.y.max = barLimits.max;
   state.barChart.options.scales.y.title.text = `Emissions (${state.unitLabel})`;
-  state.barChart.options.plugins.title.text = `${place} – ${year} (${emisSourceLabel(emisSource)})`;
+  state.barChart.options.plugins.title.text = `${place} - ${timeKey}`;
   state.barChart.update();
 
-  // LINE
-  const line = buildLineData(mode, sectorKey, emisSource);
+  const line = await buildLineData();
   state.lineChart.data.labels = line.labels;
-
-  if (hasUncertainty(emisSource)) {
-    state.lineChart.data.datasets[0].data = line.mins;
-    state.lineChart.data.datasets[1].data = line.maxs;
-    state.lineChart.data.datasets[1].fill = "-1";
-  } else {
-    const blanks = line.labels.map(() => null);
-    state.lineChart.data.datasets[0].data = blanks;
-    state.lineChart.data.datasets[1].data = blanks;
-    state.lineChart.data.datasets[1].fill = false;
-  }
-
+  state.lineChart.data.datasets[0].data = line.mins;
+  state.lineChart.data.datasets[1].data = line.maxs;
   state.lineChart.data.datasets[2].data = line.values;
 
-  let lmin, lmax;
-  if (hasUncertainty(emisSource)) {
-    const finiteMins2 = line.mins.filter(Number.isFinite);
-    const finiteMaxs2 = line.maxs.filter(Number.isFinite);
-    lmin = finiteMins2.length ? Math.min(...finiteMins2) : 0;
-    lmax = finiteMaxs2.length ? Math.max(...finiteMaxs2) : 1;
-  } else {
-    const finiteVals2 = line.values.filter(Number.isFinite);
-    lmin = finiteVals2.length ? Math.min(...finiteVals2) : 0;
-    lmax = finiteVals2.length ? Math.max(...finiteVals2) : 1;
-  }
-
-  const lim2 = getNiceLimits(lmin, lmax);
-  state.lineChart.options.scales.y.min = lim2.min;
-  state.lineChart.options.scales.y.max = lim2.max;
+  const finiteMins2 = line.mins.filter(Number.isFinite);
+  const finiteMaxs2 = line.maxs.filter(Number.isFinite);
+  const finiteVals2 = line.values.filter(Number.isFinite);
+  const lineMin = finiteMins2.length ? Math.min(...finiteMins2) : (finiteVals2.length ? Math.min(...finiteVals2) : 0);
+  const lineMax = finiteMaxs2.length ? Math.max(...finiteMaxs2) : (finiteVals2.length ? Math.max(...finiteVals2) : 1);
+  const lineLimits = getNiceLimits(lineMin, lineMax);
+  state.lineChart.options.scales.y.min = lineLimits.min;
+  state.lineChart.options.scales.y.max = lineLimits.max;
   state.lineChart.options.scales.y.title.text = `Emissions (${state.unitLabel})`;
-  state.lineChart.options.plugins.title.text = `${place} – ${labelSector(sectorKey)} (${emisSourceLabel(emisSource)})`;
+  state.lineChart.options.plugins.title.text = `${place} - ${labelSector(sectorKey)} (${timeMode === "annual" ? "annual trend" : timeMode})`;
   state.lineChart.update();
 }
 
-function initCharts() {
-  state.barChart = new Chart(state.el.barChart, {
-    type: "bar",
-    data: {
-      labels: [],
-      datasets: [{ label: "Sector", data: [], _errMin: [], _errMax: [] }],
-    },
-    options: {
-      responsive: true,
-      plugins: { title: { display: true, text: "Click a state" }, legend: { display: false } },
-      scales: { y: { beginAtZero: true, title: { display: true, text: `Emissions (${state.unitLabel})` } } },
-    },
-    plugins: [barErrorBarsPlugin],
-  });
-
-  state.lineChart = new Chart(state.el.lineChart, {
-    type: "line",
-    data: {
-      labels: [],
-      datasets: [
-        { label: "min", data: [], pointRadius: 0, borderWidth: 0 },
-        { label: "max", data: [], pointRadius: 0, borderWidth: 0, fill: "-1", backgroundColor: "rgba(0,0,0,0.12)" },
-        { label: "Value", data: [], tension: 0.2, pointRadius: 2 },
-      ],
-    },
-    options: {
-      responsive: true,
-      plugins: { title: { display: true, text: "" }, legend: { display: false } },
-      scales: { y: { beginAtZero: true, title: { display: true, text: `Emissions (${state.unitLabel})` } } },
-    },
-  });
+async function makeBarCsvRows() {
+  const bar = await buildBarData();
+  return [
+    ["type", "bar"],
+    ["view_mode", getViewMode()],
+    ["time_mode", getTimeMode()],
+    ["place", getCurrentPlaceLabel()],
+    ["time_key", getSelectedTimeKey()],
+    ["units", state.unitLabel],
+    [],
+    ["sector", "value", "min", "max"],
+    ...bar.labels.map((label, i) => [labelSector(label), bar.values[i], bar.mins[i], bar.maxs[i]]),
+  ];
 }
 
-/* ===================== UI INIT + EVENTS ===================== */
+async function makeLineCsvRows() {
+  const line = await buildLineData();
+  return [
+    ["type", "annual_trend"],
+    ["view_mode", getViewMode()],
+    ["time_mode", getTimeMode()],
+    ["place", getCurrentPlaceLabel()],
+    ["selected_time_key", getSelectedTimeKey()],
+    ["sector", labelSector(state.el.sectorSelect.value)],
+    ["units", state.unitLabel],
+    [],
+    ["year", "value", "min", "max"],
+    ...line.labels.map((label, i) => [label, line.values[i], line.mins[i], line.maxs[i]]),
+  ];
+}
 
-function populateSelect(selectEl, items, defaultValue) {
+function populateSelect(selectEl, items, defaultValue, formatter = value => value) {
   selectEl.innerHTML = "";
   for (const item of items) {
     const opt = document.createElement("option");
     opt.value = item;
-    opt.textContent = labelSector(item);
+    opt.textContent = formatter(item);
     selectEl.appendChild(opt);
   }
-  selectEl.value = defaultValue ?? items[0] ?? "";
+  selectEl.value = defaultValue && items.includes(defaultValue) ? defaultValue : (items[0] ?? "");
 }
 
 function initSelects() {
-  const emisSource = getEmisSource();
-  const yrs = activeYears(emisSource);
+  const prevTime = state.el.timeSelect?.value ?? "";
+  const prevSector = state.el.sectorSelect?.value ?? "";
 
-  // --- preserve current selections ---
-  const prevYear = Number(state.el.yearSelect.value);
-  const prevSector = state.el.sectorSelect.value;
+  const timeKeys = getTimeKeys();
+  const defaultTime = timeKeys[timeKeys.length - 1] ?? "";
 
-  // --- year options (changes with source) ---
-  state.el.yearSelect.innerHTML = "";
-  for (const y of yrs) {
-    const opt = document.createElement("option");
-    opt.value = y;
-    opt.textContent = y;
-    state.el.yearSelect.appendChild(opt);
-  }
-
-  // keep year if still available; otherwise fallback to latest
-  const yearToUse = yrs.includes(prevYear) ? prevYear : yrs[yrs.length - 1];
-  state.el.yearSelect.value = yearToUse;
-
-  // --- sector options (should NOT depend on source) ---
-  const defaultSector =
-    state.sectorKeys.includes(DEFAULT_SECTOR) ? DEFAULT_SECTOR : (state.sectorKeys[0] ?? "");
-  populateSelect(state.el.sectorSelect, state.sectorKeys, defaultSector);
-
-  // restore sector if possible
-  if (prevSector && state.sectorKeys.includes(prevSector)) {
-    state.el.sectorSelect.value = prevSector;
-  }
+  populateSelect(state.el.timeSelect, timeKeys, prevTime || defaultTime);
+  const sectors = DISPLAY_SECTORS;
+  const defaultSector = sectors.includes(DEFAULT_SECTOR) ? DEFAULT_SECTOR : sectors[0];
+  populateSelect(state.el.sectorSelect, sectors, prevSector || defaultSector, labelSector);
 }
 
-function updateDataHint() {
-  if (!state.el.dataHint) return;
-  state.el.dataHint.textContent =
-    (getEmisSource() === "ghgi") ? "Note: GHGI selection only shows 2019–2020 data." : "";
+async function handleViewModeChange() {
+  if (getViewMode() === "colombia") {
+    state.selectedProvince = null;
+  }
+  syncSelectedLabel();
+  if (state.provinceLayer) state.provinceLayer.setStyle(f => provinceFeatureStyle(f));
+  syncActiveMapLayer();
+  await updateCharts();
+}
+
+async function handleTimeModeChange() {
+  initSelects();
+  updateUnitSelectLabels();
+  setUnits(state.unit);
+  await updateMapOverlay();
+  await updateCharts();
 }
 
 function wireEvents() {
-  // Mode toggle
-  document.querySelectorAll('input[name="chartMode"]').forEach(el => {
+  document.querySelectorAll('input[name="viewMode"]').forEach(el => {
     el.addEventListener("change", async () => {
-      const mode = getChartMode();
-      if (mode === "national") hideStatesOverlay();
-      else { showStatesOverlay(); recolorStates(); }
-
-      updateCharts();
-
-      if (mode === "state" && state.gridLayer && state.statesLayer) {
-        state.statesLayer.bringToFront();
-      }
+      await handleViewModeChange();
     });
   });
 
-  // Data source selector
-  state.el.dataSourceSelect?.addEventListener("change", async () => {
-    state.emisSource = getEmisSource();
-
-    initSelects();
-    syncChartTitles();
-    recolorStates();
-    updateCharts();
-
-    // Refresh grid to prior/posterior tif (and reset scaling)
-    await setGridLayerForSelection();
+  state.el.timeSelect?.addEventListener("change", async () => {
+    await updateMapOverlay();
+    await updateCharts();
   });
 
-  // Year/Sector
-  state.el.yearSelect.addEventListener("change", async () => {
-    recolorStates();
-    updateCharts();
-    await setGridLayerForSelection();
+  state.el.sectorSelect?.addEventListener("change", async () => {
+    await updateMapOverlay();
+    await updateCharts();
   });
 
-  state.el.sectorSelect.addEventListener("change", async () => {
-    updateCharts();
-    await setGridLayerForSelection();
-  });
-
-  // Units
-  state.el.unitSelect.addEventListener("change", () => {
+  state.el.unitSelect?.addEventListener("change", async () => {
     setUnits(state.el.unitSelect.value);
-    updateCharts();
+    await updateCharts();
   });
 
-  // CSV export
-  state.el.downloadBarCsv?.addEventListener("click", () => {
-    const mode = getChartMode();
-    if (mode === "state" && !state.selectedState) {
-      alert("Click a state first (or switch to National).");
-      return;
-    }
-    const year = state.el.yearSelect.value;
-    const place = (mode === "national") ? "National" : state.selectedState;
-    const filename = `bar_${mode}_${place}_${year}_${state.unit}.csv`.replace(/\s+/g, "_");
-    downloadText(filename, toCSV(makeBarCsvRows(mode, Number(year))));
-  });
-
-  state.el.downloadLineCsv?.addEventListener("click", () => {
-    const mode = getChartMode();
-    if (mode === "state" && !state.selectedState) {
-      alert("Click a state first (or switch to National).");
-      return;
-    }
-    const sectorKey = state.el.sectorSelect.value;
-    const place = (mode === "national") ? "National" : state.selectedState;
-    const filename = `timeseries_${mode}_${place}_${labelSector(sectorKey)}_${state.unit}.csv`
-      .replace(/\s+/g, "_");
-    downloadText(filename, toCSV(makeLineCsvRows(mode, sectorKey)));
-  });
-
-  state.el.downloadNetcdf?.addEventListener("click", () => {
-    const year = Number(state.el.yearSelect.value);
-    const emisSource = getEmisSource();
-
-    const url = NETCDF_PATH(year, emisSource); // or NETCDF_PATH(year, emisSource)
-    const filename = `emissions_${emisSourceLabel(emisSource)}_${year}.nc`.replace(/\s+/g, "_");
-
-    downloadUrl(filename, url);
-  });
-
-  // Grid toggle + slider
   state.el.gridOpacitySlider?.addEventListener("input", () => {
     applyGridOpacity();
   });
 
-  state.el.gridMaxSlider.addEventListener("input", handleGridSliderInput);
+  state.el.gridMaxSlider?.addEventListener("input", () => {
+    handleGridSliderInput();
+  });
+
+  state.el.downloadBarCsv?.addEventListener("click", async () => {
+    if (!currentSelectionIsValid()) return;
+    const filename = `bar_${getViewMode()}_${getCurrentPlaceLabel()}_${getSelectedTimeKey()}_${state.unit}.csv`
+      .replace(/\s+/g, "_");
+    downloadText(filename, toCSV(await makeBarCsvRows()));
+  });
+
+  state.el.downloadLineCsv?.addEventListener("click", async () => {
+    if (!currentSelectionIsValid()) return;
+    const sectorKey = state.el.sectorSelect.value;
+    const filename = `annual_trend_${getViewMode()}_${getCurrentPlaceLabel()}_${labelSector(sectorKey)}_${state.unit}.csv`
+      .replace(/\s+/g, "_");
+    downloadText(filename, toCSV(await makeLineCsvRows()));
+  });
+
+  state.el.downloadGridNetcdf?.addEventListener("click", async () => {
+    const sectorKey = state.el.sectorSelect.value;
+    const filename = `grid_${getSelectedTimeKey()}_${labelSector(sectorKey)}.nc`
+      .replace(/\s+/g, "_");
+    downloadBlob(filename, buildGridNetcdfBlob());
+  });
 }
 
 function handleResponsiveResize() {
@@ -1021,96 +1299,44 @@ function handleResponsiveResize() {
   state.lineChart?.resize();
 }
 
-/* ===================== MAP INIT ===================== */
-
-async function initMap() {
-  state.map = L.map("map").setView([39, -98], 4);
-
-  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-    maxZoom: 10,
-    attribution: "&copy; OpenStreetMap contributors",
-  }).addTo(state.map);
-
-  const res = await fetch(STATES_GEOJSON_PATH);
-  const statesGeo = await res.json();
-
-  state.statesLayer = L.geoJSON(statesGeo, {
-    style: (feature) => makeChoroplethStyle(Number(state.el.yearSelect.value), feature),
-    onEachFeature: (feature, layer) => {
-      layer.on("click", () => {
-        const props = feature.properties || {};
-        state.selectedState = props.name || props.NAME || props.STATE_NAME;
-
-        recolorStates();
-        updateCharts();
-      });
-
-      layer.on("mouseover", () => layer.setStyle({ weight: 2 }));
-      layer.on("mouseout", () => recolorStates());
-    },
-  }).addTo(state.map);
-
-  // Grid legend control
-  state.gridLegendControl = L.control({ position: "bottomright" });
-  state.gridLegendControl.onAdd = function () {
-    const div = L.DomUtil.create("div");
-    div.className = "legend";
-    div.innerHTML = "";
-    return div;
-  };
-  state.gridLegendControl.addTo(state.map);
-  L.DomEvent.disableClickPropagation(state.gridLegendControl.getContainer());
-}
-
-/* ===================== BOOTSTRAP ===================== */
-
 async function main() {
   state.el = {
-    yearSelect: $("yearSelect"),
+    timeSelect: $("timeSelect"),
     sectorSelect: $("sectorSelect"),
     unitSelect: $("unitSelect"),
-    dataSourceSelect: $("dataSourceSelect"),
     gridOpacitySlider: $("gridOpacitySlider"),
     gridOpacityValue: $("gridOpacityValue"),
     gridMaxSlider: $("gridMaxSlider"),
     gridMaxValue: $("gridMaxValue"),
-    selectedState: $("selectedState"),
+    selectedRegion: $("selectedRegion"),
     downloadBarCsv: $("downloadBarCsv"),
     downloadLineCsv: $("downloadLineCsv"),
-    downloadNetcdf: $("downloadNetcdf"),
+    downloadGridNetcdf: $("downloadGridNetcdf"),
     barChart: $("barChart"),
     lineChart: $("lineChart"),
-    barChartTitleText: $("barChartTitleText"),
-    lineChartTitle: $("lineChartTitle"),
     dataHint: $("dataHint"),
   };
 
-  await loadStateCSVs();
-  await loadNationalCSVs();
-
-  initSelects();
+  await ensureChartDataLoaded();
+  updateUnitSelectLabels();
   setUnits(state.el.unitSelect.value);
-
+  initSelects();
   await initMap();
   initCharts();
-  syncChartTitles();
+  syncGridOpacityUI();
+  syncSelectedLabel();
+  setDataHint();
 
   window.addEventListener("resize", () => {
     clearTimeout(window.__resizeTimer);
     window.__resizeTimer = setTimeout(handleResponsiveResize, 150);
   });
 
-
-  if (getChartMode() === "national") hideStatesOverlay();
-
-  recolorStates();
-  updateCharts();
-
-  syncGridOpacityUI();
-  await setGridLayerForSelection();
-  applyGridOpacity();
-
+  await updateMapOverlay();
+  await updateCharts();
   wireEvents();
 }
 
-main();
+main().catch(err => {
+  console.error("Application failed to start:", err);
+});
