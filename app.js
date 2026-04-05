@@ -91,6 +91,12 @@ function fmt(v) {
   return Math.round(v).toString();
 }
 
+function fmtPlotValue(v, sigFigs = 2) {
+  if (v == null || !Number.isFinite(v)) return "";
+  if (v === 0) return "0";
+  return Number(v).toPrecision(sigFigs).replace(/(\.\d*?[1-9])0+e/, "$1e").replace(/\.0+e/, "e").replace(/\.0+$/, "");
+}
+
 function labelSector(sectorKey) {
   return SECTOR_LABELS[sectorKey] ?? sectorKey;
 }
@@ -987,6 +993,13 @@ function initCharts() {
           padding: { bottom: 14 },
         },
         legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label(context) {
+              return ` ${fmtPlotValue(context.parsed.y)} ${state.unitLabel}`;
+            },
+          },
+        },
       },
       scales: {
         x: {
@@ -1003,6 +1016,7 @@ function initCharts() {
           ticks: {
             font: { size: 11 },
             padding: 6,
+            callback: value => fmtPlotValue(value),
           },
           title: {
             display: true,
@@ -1040,6 +1054,14 @@ function initCharts() {
           padding: { bottom: 14 },
         },
         legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label(context) {
+              const label = context.dataset.label === "Value" ? "Value" : context.dataset.label;
+              return ` ${label}: ${fmtPlotValue(context.parsed.y)} ${state.unitLabel}`;
+            },
+          },
+        },
       },
       scales: {
         x: {
@@ -1054,6 +1076,7 @@ function initCharts() {
           ticks: {
             font: { size: 11 },
             padding: 6,
+            callback: value => fmtPlotValue(value),
           },
           title: {
             display: true,
