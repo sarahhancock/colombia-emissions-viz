@@ -2,15 +2,16 @@
    app.js
 
    Responsibilities:
-   - Load all visualization data from data/chart/chart_data.json
+   - Load summary data from data/chart/chart_summary.json
    - Initialize Leaflet map for Colombia
    - Rebuild grid-cell polygons from embedded lat/lon arrays
+   - Load annual grid overlays lazily from split grid files
    - Support Department / Colombia chart views
    - Draw bar + annual trend charts with uncertainty
    - Export chart data as CSV and the grid overlay as NetCDF
    ========================================================= */
 
-const CHART_DATA_PATH = "data/chart/chart_data.json";
+const CHART_DATA_PATH = "data/chart/chart_summary.json";
 const DEFAULT_SECTOR = "TotalAnth";
 const DISPLAY_SECTORS = ["Coal", "Waste", "OilGas", "Livestock", "Reservoirs", "Rice", "Other", "TotalAnth"];
 const BAR_DISPLAY_SECTORS = ["Coal", "Waste", "OilGas", "Livestock", "Reservoirs", "Rice", "Other"];
@@ -43,12 +44,15 @@ const GRID_DEFAULT_SLIDER_FRACTION = 0.6;
 const GRID_MIN_VALUE = 0.001;
 const PROVINCE_NAME_KEYS = ["PROVINCE", "province", "NAME_1", "name", "NAME"];
 const GRID_UNITS_HTML = "kg km<sup>-2</sup> h<sup>-1</sup>";
+const DEFAULT_PROVINCE_GEOJSON_PATH = "data/geo/province_geojson.json";
 
 const state = {
   chartData: null,
   sectors: [],
   provinceNames: [],
   gridMeta: null,
+  provinceGeojson: null,
+  gridCache: {},
 
   map: null,
   provinceLayer: null,
@@ -249,12 +253,12 @@ function downloadBlob(filename, blob) {
   URL.revokeObjectURL(url);
 }
 
-function buildGridNetcdfBlob() {
+async function buildGridNetcdfBlob() {
   const grid = state.gridMeta;
   const timeKey = getSelectedTimeKey();
   const sectorKey = state.el.sectorSelect.value;
-  const gridStore = getGridStoreForTime(timeKey);
-  const values = aggregateMapValues(gridStore, sectorKey);
+  const gridRecord = await ensureGridValuesLoaded(timeKey, sectorKey);
+  const values = gridRecord?.values ?? null;
 
   if (!grid?.lats?.length || !grid?.lons?.length || !values?.length) {
     throw new Error("Grid data are not available for NetCDF export.");
@@ -300,7 +304,7 @@ function buildGridNetcdfBlob() {
       dataBytes: nlat * nlon * 4,
       attrs: [
         { name: "long_name", value: `${labelSector(sectorKey)} emissions` },
-        { name: "units", value: state.chartData?.grid_units ?? "kg km-2 h-1" },
+        { name: "units", value: gridRecord?.units ?? state.chartData?.grid_units ?? "kg km-2 h-1" },
         { name: "time_key", value: timeKey },
         { name: "time_mode", value: getTimeMode() },
         { name: "sector", value: labelSector(sectorKey) },
@@ -489,7 +493,7 @@ function setDataHint() {
   if (!state.el.dataHint) return;
   const viewMode = getViewMode();
 
-  let msg = "The emissions field and charts are loaded directly from chart_data.json.";
+  let msg = "Charts are loaded from chart_summary.json, and the map loads annual grid files on demand.";
   msg += " The bar chart summarizes the selected year, and the trend chart shows annual change through time.";
   msg += viewMode === "province"
     ? " Click a department boundary to update the charts."
@@ -519,9 +523,44 @@ async function ensureChartDataLoaded() {
   if (state.chartData) return;
 
   state.chartData = await fetchJSON(CHART_DATA_PATH);
-  state.sectors = state.chartData.sectors ?? [];
+  state.sectors = state.chartData.display_sectors ?? [];
   state.gridMeta = state.chartData.grid ?? null;
+  const provincePath = state.chartData.province_geojson_path || DEFAULT_PROVINCE_GEOJSON_PATH;
+  state.provinceGeojson = state.chartData.province_geojson ?? await fetchJSON(provincePath);
   state.provinceNames = Object.keys(state.chartData.annual?.provinces ?? {}).sort();
+}
+
+function getGridFilePath(timeKey, sectorKey) {
+  return state.chartData?.grid_files?.annual?.[timeKey]?.[sectorKey] ?? null;
+}
+
+async function ensureGridValuesLoaded(timeKey, sectorKey) {
+  if (!timeKey || !sectorKey) return null;
+
+  if (!state.gridCache[timeKey]) {
+    state.gridCache[timeKey] = {};
+  }
+
+  if (state.gridCache[timeKey][sectorKey]) {
+    return state.gridCache[timeKey][sectorKey];
+  }
+
+  const path = getGridFilePath(timeKey, sectorKey);
+  if (!path) return null;
+
+  const payload = await fetchJSON(path);
+  const values = Array.isArray(payload?.values)
+    ? payload.values.map(v => (Number.isFinite(v) ? Number(v) : null))
+    : null;
+
+  const record = {
+    path,
+    units: payload?.units ?? state.chartData?.grid_units ?? "kg km-2 h-1",
+    values,
+  };
+
+  state.gridCache[timeKey][sectorKey] = record;
+  return record;
 }
 
 function getGridUnitsHtml() {
@@ -564,6 +603,10 @@ function getSelectionEntry(timeKey) {
 function aggregateRange(entry, displaySectorKey) {
   if (!entry) return { value: null, min: null, max: null };
 
+  if (entry[displaySectorKey]) {
+    return makeValueRange(entry[displaySectorKey]);
+  }
+
   const sectorKeys = DISPLAY_SECTOR_MAP[displaySectorKey] ?? [displaySectorKey];
   let value = 0;
   let min = 0;
@@ -593,35 +636,6 @@ function aggregateRange(entry, displaySectorKey) {
     min: hasMin ? min : null,
     max: hasMax ? max : null,
   };
-}
-
-function getGridStoreForTime(timeKey) {
-  const store = getSeriesStore();
-  return store.maps?.[timeKey] ?? null;
-}
-
-function aggregateMapValues(gridStore, displaySectorKey) {
-  const sectorKeys = DISPLAY_SECTOR_MAP[displaySectorKey] ?? [displaySectorKey];
-  const arrays = sectorKeys.map(key => gridStore?.[key]).filter(Boolean);
-  if (!arrays.length) return null;
-
-  const length = arrays[0].length;
-  const out = new Array(length).fill(null);
-
-  for (let i = 0; i < length; i++) {
-    let sum = 0;
-    let hasFinite = false;
-    for (const arr of arrays) {
-      const value = arr[i];
-      if (Number.isFinite(value)) {
-        sum += value;
-        hasFinite = true;
-      }
-    }
-    out[i] = hasFinite ? sum : null;
-  }
-
-  return out;
 }
 
 function getGridOpacity() {
@@ -723,7 +737,7 @@ function updateGridLegend() {
 function buildGridCells() {
   const grid = state.gridMeta;
   if (!grid?.lats?.length || !grid?.lons?.length) {
-    throw new Error("Missing grid metadata in chart_data.json");
+    throw new Error("Missing grid metadata in chart_summary.json");
   }
 
   const lats = grid.lats;
@@ -829,8 +843,8 @@ async function updateMapOverlay() {
     return;
   }
 
-  const gridStore = getGridStoreForTime(timeKey);
-  const values = aggregateMapValues(gridStore, sectorKey);
+  const gridRecord = await ensureGridValuesLoaded(timeKey, sectorKey);
+  const values = gridRecord?.values ?? null;
   if (!values?.length) {
     clearGridLayer();
     return;
@@ -891,7 +905,7 @@ async function initMap() {
 
   state.currentGridCells = buildGridCells();
 
-  state.provinceLayer = L.geoJSON(state.chartData.province_geojson, {
+  state.provinceLayer = L.geoJSON(state.provinceGeojson, {
     pane: "provincePane",
     style: feature => provinceFeatureStyle(feature),
     onEachFeature: (feature, layer) => {
@@ -1289,7 +1303,7 @@ function wireEvents() {
     const sectorKey = state.el.sectorSelect.value;
     const filename = `grid_${getSelectedTimeKey()}_${labelSector(sectorKey)}.nc`
       .replace(/\s+/g, "_");
-    downloadBlob(filename, buildGridNetcdfBlob());
+    downloadBlob(filename, await buildGridNetcdfBlob());
   });
 }
 
